@@ -1,317 +1,326 @@
 import os
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, TextMessage, FlexMessage, FlexContainer
+    ReplyMessageRequest,
+    TextMessage,
+    QuickReply, QuickReplyItem, MessageAction,
+    RichMenuRequest, RichMenuArea, RichMenuBounds, RichMenuSize,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
-import storage  # our local storage module
+import storage
 
 app = Flask(__name__)
-
 configuration = Configuration(access_token=os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 
-# ── 時段判斷 ──────────────────────────────────────────────
-def get_meal_type_by_time():
-    hour = datetime.now().hour
-    if 5 <= hour < 10:
-        return "早餐"
-    elif 10 <= hour < 14:
-        return "午餐"
-    elif 14 <= hour < 17:
-        return "下午茶"
-    elif 17 <= hour < 21:
-        return "晚餐"
-    else:
-        return "宵夜"
+# ── 用戶對話狀態 ─────────────────────────────────────────
+user_state = {}
 
-# ── 解析食材輸入 ──────────────────────────────────────────
-def parse_food_input(text):
-    """
-    解析如: 雞胸肉150g 白米100g 花椰菜80g 油5g
-    支援: g, kg, ml, cc, 克, 毫升, 公克
-    """
-    ingredients = []
-    # 匹配 食材名稱 + 數字 + 單位
-    pattern = r'([^\d\s，,、\n]+?)\s*(\d+(?:\.\d+)?)\s*(g|kg|ml|cc|克|毫升|公克|公升)?'
-    matches = re.findall(pattern, text)
-    for name, amount, unit in matches:
-        name = name.strip('、，, ')
-        if name and amount:
-            unit = unit or 'g'
-            ingredients.append({
-                'name': name,
-                'amount': float(amount),
-                'unit': unit
-            })
-    return ingredients
+def get_state(uid):
+    if uid not in user_state:
+        user_state[uid] = {'step': None, 'data': {}}
+    return user_state[uid]
 
-# ── 判斷輸入類型 ──────────────────────────────────────────
-def classify_input(text):
-    t = text.strip()
+def clear_state(uid):
+    user_state[uid] = {'step': None, 'data': {}}
 
-    # 體重: 純數字 50~150，或含kg/公斤
-    if re.match(r'^(\d{2,3}(?:\.\d{1,2})?)\s*(kg|公斤|KG)$', t, re.I):
-        return 'weight'
-    if re.match(r'^(\d{2,3}(?:\.\d{1,2})?)$', t):
-        val = float(t)
-        if 30 <= val <= 200:
-            return 'weight'
+def today():
+    return datetime.now().strftime('%Y-%m-%d')
 
-    # 飲水: 含ml/cc/毫升/杯/升
-    if re.search(r'\d+\s*(ml|cc|毫升|公升|升|杯)', t, re.I):
-        return 'water'
+def now_time():
+    return datetime.now().strftime('%H:%M')
 
-    # 睡眠
-    if re.search(r'睡(了|覺|眠)?|起床|就寢|\d+小時', t):
-        return 'sleep'
-    if re.search(r'\d{1,2}[：:點]\d{2}.*[到至~\-].*\d{1,2}[：:點]\d{2}', t):
-        return 'sleep'
+# ── 解析函式 ─────────────────────────────────────────────
+def parse_ingredients(text):
+    out = []
+    for m in re.finditer(r'([^\d\s，,、\n]+?)\s*(\d+(?:\.\d+)?)\s*(g|kg|ml|cc|克|毫升|公克)?', text):
+        name = m.group(1).strip('、，, ')
+        if name and m.group(2):
+            out.append({'name': name, 'amount': float(m.group(2)), 'unit': m.group(3) or 'g'})
+    return out
 
-    # 排便
-    if re.search(r'排便|大便|便便|上大號|便秘|拉肚子|順暢|硬便|軟便', t):
-        return 'poop'
-
-    # 心得/筆記
-    if re.search(r'心得|感覺|覺得|狀態|今天很|身體|飽|餓|不舒服|備註|筆記', t):
-        return 'note'
-
-    # 指令
-    if re.search(r'^(今日|今天)?(報告|摘要|總結|記錄|日誌|查看|看一下)', t):
-        return 'summary'
-    if t in ['說明', '幫助', 'help', '怎麼用', '功能']:
-        return 'help'
-
-    # 食物（有食材+克數 或 含常見餐食關鍵字）
-    if re.search(r'\d+\s*(g|克|公克|份|碗|片|顆|條)', t):
-        return 'meal'
-    if re.search(r'吃了|早餐|午餐|晚餐|下午茶|宵夜|點心', t):
-        return 'meal'
-
-    # 預設也當餐食記錄（純文字描述）
-    return 'meal'
-
-# ── 解析體重 ──────────────────────────────────────────────
 def parse_weight(text):
     m = re.search(r'(\d{2,3}(?:\.\d{1,2})?)', text)
     return float(m.group(1)) if m else None
 
-# ── 解析飲水 ──────────────────────────────────────────────
 def parse_water(text):
-    m = re.search(r'(\d+(?:\.\d+)?)\s*(ml|cc|毫升|公升|升|杯)', text, re.I)
-    if not m:
-        return None
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(ml|cc|毫升|升|杯)', text, re.I)
+    if not m: return None
     val = float(m.group(1))
-    unit = m.group(2).lower()
-    if unit in ['杯']:
-        val *= 250
-    elif unit in ['升', '公升']:
-        val *= 1000
+    u = m.group(2).lower()
+    if u == '杯': val *= 250
+    elif u == '升': val *= 1000
     return int(val)
 
-# ── 解析睡眠 ──────────────────────────────────────────────
 def parse_sleep(text):
-    # 格式: 7小時 / 7.5小時
     m = re.search(r'(\d+(?:\.\d+)?)\s*小時', text)
-    if m:
-        return {'hours': float(m.group(1))}
-    # 格式: 23:00到6:30
+    if m: return {'hours': float(m.group(1))}
     m = re.search(r'(\d{1,2})[：:點](\d{2})?\s*[到至~\-]\s*(\d{1,2})[：:點](\d{2})?', text)
     if m:
-        bed_h, bed_m = int(m.group(1)), int(m.group(2) or 0)
-        wake_h, wake_m = int(m.group(3)), int(m.group(4) or 0)
-        mins = (wake_h * 60 + wake_m) - (bed_h * 60 + bed_m)
-        if mins < 0:
-            mins += 1440
-        hours = round(mins / 60, 1)
-        return {
-            'hours': hours,
-            'bed': f'{bed_h:02d}:{bed_m:02d}',
-            'wake': f'{wake_h:02d}:{wake_m:02d}'
-        }
+        bh, bm = int(m.group(1)), int(m.group(2) or 0)
+        wh, wm = int(m.group(3)), int(m.group(4) or 0)
+        mins = (wh*60+wm) - (bh*60+bm)
+        if mins < 0: mins += 1440
+        return {'hours': round(mins/60, 1),
+                'bed': f'{bh:02d}:{bm:02d}', 'wake': f'{wh:02d}:{wm:02d}'}
     return None
 
-# ── 解析排便 ──────────────────────────────────────────────
 def parse_poop(text):
-    if re.search(r'便秘', text):
-        status = '便秘 ⚠️'
-    elif re.search(r'拉肚子|稀|水', text):
-        status = '稀軟 ⚠️'
-    elif re.search(r'硬', text):
-        status = '偏硬'
-    elif re.search(r'順暢|正常|ok|OK', text):
-        status = '順暢 ✓'
-    elif re.search(r'軟', text):
-        status = '偏軟'
-    else:
-        status = '有記錄 ✓'
-    return status
+    if re.search(r'便秘', text): return '便秘 ⚠️'
+    if re.search(r'拉肚子|稀|水便', text): return '稀軟 ⚠️'
+    if re.search(r'硬', text): return '偏硬'
+    if re.search(r'順暢|正常', text): return '順暢 ✓'
+    if re.search(r'軟', text): return '偏軟'
+    return '有記錄 ✓'
 
-# ── 產生回覆文字 ──────────────────────────────────────────
-def format_summary(user_id):
-    today = datetime.now().strftime('%Y-%m-%d')
-    data = storage.get_day(user_id, today)
+def parse_nutrition(text):
+    nut = {}
+    for key, pat in {
+        'kcal': r'(?:熱量|卡路里|卡|kcal)\s*[:：]?\s*(\d+(?:\.\d+)?)',
+        'carb': r'(?:碳水化合物|碳水|醣類)\s*[:：]?\s*(\d+(?:\.\d+)?)',
+        'protein': r'(?:蛋白質|蛋白)\s*[:：]?\s*(\d+(?:\.\d+)?)',
+        'fat': r'(?:脂肪|油脂)\s*[:：]?\s*(\d+(?:\.\d+)?)',
+    }.items():
+        m = re.search(pat, text, re.I)
+        if m: nut[key] = float(m.group(1))
+    return nut
 
-    lines = [f"📋 {today} 飲控日誌\n"]
+# ── Quick Reply ──────────────────────────────────────────
+def meal_quick_reply():
+    items = [QuickReplyItem(action=MessageAction(label=m, text=f'__餐別__{m}'))
+             for m in ['早餐', '午餐', '晚餐', '下午茶', '宵夜', '點心']]
+    return QuickReply(items=items)
 
-    # 體重
-    if data.get('weight'):
-        lines.append(f"⚖️ 體重：{data['weight']} kg")
+# ── 回覆 ─────────────────────────────────────────────────
+def reply(reply_token, text, qr=None):
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=reply_token,
+                                messages=[TextMessage(text=text, quick_reply=qr)])
+        )
 
-    # 飲水
+# ── 今日總覽 ─────────────────────────────────────────────
+def build_summary(uid):
+    data = storage.get_day(uid, today())
+    lines = [f'📋 {today()} 飲控日誌', '─'*18]
+    if data.get('weight'): lines.append(f'⚖️ 體重：{data["weight"]} kg')
     if data.get('water'):
-        lines.append(f"💧 飲水：{data['water']} ml")
-
-    # 睡眠
+        pct = min(100, round(data['water']/2000*100))
+        lines.append(f'💧 飲水：{data["water"]} ml（目標 {pct}%）')
     if data.get('sleep'):
         s = data['sleep']
-        if s.get('bed'):
-            lines.append(f"🌙 睡眠：{s['bed']}～{s['wake']}（{s['hours']}小時）")
-        else:
-            lines.append(f"🌙 睡眠：{s['hours']} 小時")
+        if s.get('bed'): lines.append(f'🌙 睡眠：{s["bed"]}～{s["wake"]}（{s["hours"]}h）')
+        else: lines.append(f'🌙 睡眠：{s["hours"]} 小時')
+    if data.get('poop'): lines.append(f'🚽 排便：{data["poop"]}')
 
-    # 排便
-    if data.get('poop'):
-        lines.append(f"🚽 排便：{data['poop']}")
-
-    # 餐食
     meals = data.get('meals', [])
     if meals:
-        lines.append("\n🍱 餐食記錄：")
+        lines.append(f'\n🍱 餐食（{len(meals)} 餐）')
         for meal in meals:
-            lines.append(f"  【{meal['type']}】{meal['name']}")
+            lines.append(f'【{meal["type"]}】{meal["name"]}　{meal.get("time","")}')
             for ing in meal.get('ingredients', []):
-                lines.append(f"    · {ing['name']} {ing['amount']}{ing['unit']}")
-            if meal.get('oil'):
-                lines.append(f"    · 用油 {meal['oil']}")
+                lines.append(f'  · {ing["name"]} {ing["amount"]}{ing["unit"]}')
+            if meal.get('oil'): lines.append(f'  · 用油 {meal["oil"]}')
+            n = meal.get('nutrition', {})
+            parts = []
+            if n.get('kcal'): parts.append(f'{n["kcal"]}kcal')
+            if n.get('carb'): parts.append(f'碳水{n["carb"]}g')
+            if n.get('protein'): parts.append(f'蛋白{n["protein"]}g')
+            if n.get('fat'): parts.append(f'脂肪{n["fat"]}g')
+            if parts: lines.append(f'  📊 {" | ".join(parts)}')
+            if meal.get('note'): lines.append(f'  💬 {meal["note"]}')
 
-    # 心得
     notes = data.get('notes', [])
     if notes:
-        lines.append("\n📝 心得筆記：")
-        for note in notes:
-            lines.append(f"  {note['text']}")
+        lines.append('\n📝 備註')
+        for note in notes: lines.append(f'  「{note["text"]}」')
 
-    if len(lines) == 1:
-        lines.append("今天還沒有記錄喔，快開始吧！")
-
+    if len(lines) == 2:
+        lines.append('今天還沒有記錄，請使用底部選單開始！')
     return '\n'.join(lines)
 
-def format_help():
-    return """🌿 飲控日記使用說明
+# ── 身體數據流程 ─────────────────────────────────────────
+def start_body(uid, reply_token):
+    s = get_state(uid)
+    s['step'] = 'body_weight'
+    s['data'] = {}
+    reply(reply_token, '⚖️ 記錄身體數據\n\n第 1/4：請輸入今日體重\n例如：65.5\n\n（輸入「跳過」略過此項）')
 
-━━ 餐食記錄 ━━
-直接輸入食材即可！
-例：雞胸肉150g 白米100g 花椰菜80g 油5g
+def handle_body(uid, text, reply_token):
+    s = get_state(uid)
+    step = s['step']
 
-系統會依時段自動判斷
-早餐(5-10點)、午餐(10-14點)
-下午茶(14-17點)、晚餐(17-21點)
-宵夜(21點後)
+    if step == 'body_weight':
+        if text != '跳過':
+            val = parse_weight(text)
+            if not val:
+                reply(reply_token, '請輸入有效數字（例如：65.5），或輸入「跳過」')
+                return
+            storage.save_weight(uid, today(), val)
+            s['data']['weight'] = val
+        s['step'] = 'body_water'
+        reply(reply_token, '💧 第 2/4：請輸入今日飲水量\n例如：1500ml、6杯\n\n（輸入「跳過」略過此項）')
 
-━━ 其他記錄 ━━
-體重：65.5  或  65.5kg
-飲水：500ml  或  喝了2杯水
-睡眠：睡了7小時  或  23:00到6:30
-排便：排便順暢  或  便秘
-心得：今天感覺很飽足
+    elif step == 'body_water':
+        if text != '跳過':
+            ml = parse_water(text)
+            if not ml:
+                reply(reply_token, '請輸入有效格式（例如：1500ml、6杯），或輸入「跳過」')
+                return
+            storage.add_water(uid, today(), ml)
+            s['data']['water'] = ml
+        s['step'] = 'body_sleep'
+        reply(reply_token, '🌙 第 3/4：請輸入睡眠資訊\n例如：睡了7.5小時\n例如：23:00到6:30\n\n（輸入「跳過」略過此項）')
 
-━━ 查看記錄 ━━
-輸入「今日報告」查看今天所有紀錄"""
+    elif step == 'body_sleep':
+        if text != '跳過':
+            info = parse_sleep(text)
+            if not info:
+                reply(reply_token, '請輸入有效格式（例如：睡了7小時），或輸入「跳過」')
+                return
+            storage.save_sleep(uid, today(), info)
+            s['data']['sleep'] = info
+        s['step'] = 'body_poop'
+        reply(reply_token, '🚽 第 4/4：請輸入排便狀況\n可輸入：順暢、正常、偏硬、偏軟、便秘、拉肚子\n\n（輸入「跳過」略過此項）')
 
-# ── 主要處理邏輯 ──────────────────────────────────────────
-def handle_text(user_id, text):
-    today = datetime.now().strftime('%Y-%m-%d')
-    now_time = datetime.now().strftime('%H:%M')
-    input_type = classify_input(text)
+    elif step == 'body_poop':
+        if text != '跳過':
+            status = parse_poop(text)
+            storage.save_poop(uid, today(), status)
+            s['data']['poop'] = status
+        d = s['data'].copy()
+        clear_state(uid)
+        lines = ['✅ 身體數據記錄完成！\n']
+        if d.get('weight'): lines.append(f'⚖️ 體重：{d["weight"]} kg')
+        if d.get('water'): lines.append(f'💧 飲水：{d["water"]} ml')
+        if d.get('sleep'):
+            sv = d['sleep']
+            if sv.get('bed'): lines.append(f'🌙 睡眠：{sv["bed"]}～{sv["wake"]}（{sv["hours"]}h）')
+            else: lines.append(f'🌙 睡眠：{sv["hours"]}小時')
+        if d.get('poop'): lines.append(f'🚽 排便：{d["poop"]}')
+        reply(reply_token, '\n'.join(lines))
 
-    if input_type == 'help':
-        return format_help()
+# ── 餐食記錄流程 ─────────────────────────────────────────
+def start_meal(uid, reply_token):
+    s = get_state(uid)
+    s['step'] = 'meal_type'
+    s['data'] = {}
+    reply(reply_token, '🍱 記錄餐食\n請選擇餐別 👇', qr=meal_quick_reply())
 
-    if input_type == 'summary':
-        return format_summary(user_id)
+def handle_meal(uid, text, reply_token):
+    s = get_state(uid)
+    step = s['step']
 
-    if input_type == 'weight':
-        val = parse_weight(text)
-        if val:
-            storage.save_weight(user_id, today, val)
-            return f"⚖️ 體重記錄：{val} kg\n時間：{now_time}\n\n輸入「今日報告」可查看今天所有紀錄"
+    if step == 'meal_type':
+        meal_type = text.replace('__餐別__', '')
+        s['data']['type'] = meal_type
+        s['data']['time'] = now_time()
+        s['step'] = 'meal_name'
+        reply(reply_token, f'【{meal_type}】\n\n第 1/4：請輸入餐食名稱\n例如：雞胸肉便當、水煮餐')
 
-    if input_type == 'water':
-        ml = parse_water(text)
-        if ml:
-            total = storage.add_water(user_id, today, ml)
-            return f"💧 飲水記錄：+{ml} ml\n今日累計：{total} ml\n目標：2000 ml（{'✓ 達標！' if total >= 2000 else f'還差 {2000-total} ml'}）"
+    elif step == 'meal_name':
+        s['data']['name'] = text
+        s['step'] = 'meal_ingredients'
+        reply(reply_token,
+            '第 2/4：請輸入食材與克數\n\n'
+            '格式：食材名稱+數量，每行一項\n'
+            '例如：\n雞胸肉 150g\n白米飯 100g\n花椰菜 80g\n食用油 5g\n\n'
+            '（輸入「跳過」略過此項）')
 
-    if input_type == 'sleep':
-        info = parse_sleep(text)
-        if info:
-            storage.save_sleep(user_id, today, info)
-            hours = info['hours']
-            eval_text = '充足 👍' if hours >= 7 else ('尚可' if hours >= 6 else '不足，注意休息 ⚠️')
-            if info.get('bed'):
-                return f"🌙 睡眠記錄\n就寢：{info['bed']}\n起床：{info['wake']}\n時長：{hours} 小時（{eval_text}）"
-            return f"🌙 睡眠記錄：{hours} 小時（{eval_text}）"
+    elif step == 'meal_ingredients':
+        if text != '跳過':
+            ings = parse_ingredients(text)
+            oil_m = re.search(r'(?:食用)?油\s*(\d+(?:\.\d+)?)\s*(g|克|ml)?', text)
+            s['data']['ingredients'] = ings
+            s['data']['oil'] = f'{oil_m.group(1)}{oil_m.group(2) or "g"}' if oil_m else None
+        else:
+            s['data']['ingredients'] = []
+            s['data']['oil'] = None
+        s['step'] = 'meal_nutrition'
+        reply(reply_token,
+            '第 3/4：請輸入營養資訊\n\n'
+            '格式範例（每行一項）：\n'
+            '卡路里 500\n碳水 60\n蛋白質 30\n脂肪 10\n\n'
+            '（輸入「跳過」略過此項）')
 
-    if input_type == 'poop':
-        status = parse_poop(text)
-        storage.save_poop(user_id, today, status)
-        return f"🚽 排便記錄：{status}\n時間：{now_time}"
+    elif step == 'meal_nutrition':
+        if text != '跳過':
+            s['data']['nutrition'] = parse_nutrition(text)
+        else:
+            s['data']['nutrition'] = {}
+        s['step'] = 'meal_note'
+        reply(reply_token, '第 4/4：餐後心得（選填）\n\n例如：飽足感不錯、有點油膩\n\n（輸入「跳過」完成記錄）')
 
-    if input_type == 'note':
-        storage.add_note(user_id, today, text)
-        return f"📝 心得已記錄：\n「{text}」"
+    elif step == 'meal_note':
+        if text != '跳過':
+            s['data']['note'] = text
+        meal = s['data'].copy()
+        storage.add_meal(uid, today(), meal)
+        clear_state(uid)
 
-    # 預設：餐食記錄
-    meal_type = get_meal_type_by_time()
-    # 偵測是否有明確指定餐別
-    for keyword in ['早餐', '午餐', '晚餐', '下午茶', '宵夜', '點心']:
-        if keyword in text:
-            meal_type = keyword
-            break
+        lines = [f'✅ {meal["type"]}記錄完成！（{meal.get("time","")}）\n']
+        lines.append(f'🍽 {meal["name"]}')
+        for ing in meal.get('ingredients', []):
+            lines.append(f'  · {ing["name"]} {ing["amount"]}{ing["unit"]}')
+        if meal.get('oil'): lines.append(f'  · 用油 {meal["oil"]}')
+        n = meal.get('nutrition', {})
+        parts = []
+        if n.get('kcal'): parts.append(f'{n["kcal"]}kcal')
+        if n.get('carb'): parts.append(f'碳水{n["carb"]}g')
+        if n.get('protein'): parts.append(f'蛋白{n["protein"]}g')
+        if n.get('fat'): parts.append(f'脂肪{n["fat"]}g')
+        if parts: lines.append(f'\n📊 {" | ".join(parts)}')
+        if meal.get('note'): lines.append(f'\n💬 {meal["note"]}')
+        reply(reply_token, '\n'.join(lines))
 
-    ingredients = parse_food_input(text)
-    # 抓取油量
-    oil = None
-    oil_match = re.search(r'(?:食用)?油\s*(\d+(?:\.\d+)?)\s*(g|克|ml)?', text)
-    if oil_match:
-        oil = f"{oil_match.group(1)}{oil_match.group(2) or 'g'}"
+# ── 主處理 ───────────────────────────────────────────────
+def handle_text(uid, text, reply_token):
+    s = get_state(uid)
 
-    # 若完全無法解析食材，把整段文字當作餐食名稱
-    meal_name = text
-    if ingredients:
-        # 用第一個食材名稱或全文當標題
-        meal_name = ingredients[0]['name'] if len(ingredients) == 1 else text[:20]
+    # 圖文選單觸發
+    if text == '__記錄身體數據__':
+        start_body(uid, reply_token); return
+    if text == '__記錄餐食__':
+        start_meal(uid, reply_token); return
+    if text in ['__今日總覽__', '今日總覽', '今日報告', '查看']:
+        reply(reply_token, build_summary(uid)); return
 
-    meal = {
-        'type': meal_type,
-        'name': meal_name,
-        'ingredients': ingredients,
-        'oil': oil,
-        'time': now_time
-    }
-    storage.add_meal(user_id, today, meal)
+    # 取消
+    if text in ['取消', '重來', 'cancel']:
+        clear_state(uid)
+        reply(reply_token, '已取消目前操作\n請使用底部選單繼續'); return
 
-    # 組回覆
-    reply_lines = [f"🍱 {meal_type}已記錄！（{now_time}）"]
-    if ingredients:
-        for ing in ingredients:
-            reply_lines.append(f"  · {ing['name']} {ing['amount']}{ing['unit']}")
-        if oil:
-            reply_lines.append(f"  · 用油 {oil}")
-    else:
-        reply_lines.append(f"  · {meal_name}")
-    reply_lines.append("\n輸入「今日報告」查看完整記錄")
-    return '\n'.join(reply_lines)
+    # 說明
+    if text in ['說明', 'help']:
+        reply(reply_token,
+            '🌿 飲控日記使用說明\n\n'
+            '請使用底部選單按鈕：\n\n'
+            '🏥 記錄身體數據\n  體重 → 飲水 → 睡眠 → 排便\n\n'
+            '🍱 記錄餐食\n  選擇餐別 → 餐食名稱 → 食材克數\n  → 營養素 → 餐後心得\n\n'
+            '📋 今日總覽\n  查看今天所有記錄\n\n'
+            '💡 每步驟都可輸入「跳過」略過\n'
+            '💡 輸入「取消」中斷目前操作'); return
+
+    # 進行中流程
+    if s['step'] and s['step'].startswith('body_'):
+        handle_body(uid, text, reply_token); return
+    if s['step'] and s['step'].startswith('meal_'):
+        handle_meal(uid, text, reply_token); return
+
+    # 無流程預設
+    reply(reply_token,
+        '請使用底部選單開始 👇\n\n'
+        '輸入「說明」查看使用方法\n'
+        '輸入「今日總覽」查看今天記錄')
 
 # ── Webhook ───────────────────────────────────────────────
-@app.route("/callback", methods=['POST'])
+@app.route('/callback', methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
@@ -321,23 +330,43 @@ def callback():
         abort(400)
     return 'OK'
 
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    user_id = event.source.user_id
-    text = event.message.text
-    reply_token = event.reply_token
-
-    response_text = handle_text(user_id, text)
-
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=response_text)]
+# ── 建立圖文選單（瀏覽這個網址執行一次） ────────────────
+@app.route('/setup', methods=['GET'])
+def setup():
+    try:
+        with ApiClient(configuration) as api_client:
+            api = MessagingApi(api_client)
+            rich_menu = RichMenuRequest(
+                size=RichMenuSize(width=2500, height=843),
+                selected=True,
+                name='飲控日記選單',
+                chat_bar_text='📋 飲控日記',
+                areas=[
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=0, y=0, width=833, height=843),
+                        action=MessageAction(label='記錄身體數據', text='__記錄身體數據__')
+                    ),
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=833, y=0, width=834, height=843),
+                        action=MessageAction(label='記錄餐食', text='__記錄餐食__')
+                    ),
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=1667, y=0, width=833, height=843),
+                        action=MessageAction(label='今日總覽', text='__今日總覽__')
+                    ),
+                ]
             )
-        )
+            result = api.create_rich_menu(rich_menu)
+            rid = result.rich_menu_id
+            api.set_default_rich_menu(rid)
+            return (f'<h2>✅ 圖文選單建立成功！</h2>'
+                    f'<p>Rich Menu ID: {rid}</p>'
+                    f'<p>已設為預設選單。</p>'
+                    f'<h3>⚠️ 還需要上傳選單圖片</h3>'
+                    f'<p>請前往 LINE Official Account Manager → 圖文選單 → 上傳圖片</p>'
+                    f'<p>或者不上傳圖片也可使用，底部會顯示「📋 飲控日記」文字列。</p>')
+    except Exception as e:
+        return f'<h2>錯誤</h2><p>{e}</p>'
 
-if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
