@@ -331,11 +331,61 @@ def callback():
     return 'OK'
 
 # ── 建立圖文選單（瀏覽這個網址執行一次） ────────────────
+def generate_rich_menu_image():
+    """
+    用 Pillow 產生一張簡單的圖文選單圖片（2500x843）
+    三個按鈕：記錄身體數據 / 記錄餐食 / 今日總覽
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+
+    W, H = 2500, 843
+    img = Image.new('RGB', (W, H), color='#1a7060')
+    draw = ImageDraw.Draw(img)
+
+    sections = [
+        {'x': 0,    'w': 833,  'bg': '#1a7060', 'border': '#ffffff', 'emoji': '🏥', 'label': '記錄身體數據'},
+        {'x': 833,  'w': 834,  'bg': '#2d7a4f', 'border': '#ffffff', 'emoji': '🍱', 'label': '記錄餐食'},
+        {'x': 1667, 'w': 833,  'bg': '#185fa5', 'border': '#ffffff', 'emoji': '📋', 'label': '今日總覽'},
+    ]
+
+    # Try to load a font, fall back to default
+    try:
+        font_big = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 100)
+        font_small = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 80)
+    except Exception:
+        font_big = ImageFont.load_default()
+        font_small = font_big
+
+    for sec in sections:
+        x, w = sec['x'], sec['w']
+        # Background
+        draw.rectangle([x, 0, x+w, H], fill=sec['bg'])
+        # Divider line
+        draw.line([(x, 0), (x, H)], fill='#ffffff', width=3)
+        # Label text (center)
+        label = sec['label']
+        bbox = draw.textbbox((0, 0), label, font=font_small)
+        tw = bbox[2] - bbox[0]
+        tx = x + (w - tw) // 2
+        ty = H // 2 + 20
+        draw.text((tx, ty), label, font=font_small, fill='#ffffff')
+        # Simple circle for emoji area
+        cx, cy, r = x + w//2, H//2 - 100, 110
+        draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill='rgba(255,255,255,30)', outline='#ffffff', width=4)
+
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    return buf.read()
+
 @app.route('/setup', methods=['GET'])
 def setup():
     try:
         with ApiClient(configuration) as api_client:
             api = MessagingApi(api_client)
+
+            # Step 1: 建立圖文選單結構
             rich_menu = RichMenuRequest(
                 size=RichMenuSize(width=2500, height=843),
                 selected=True,
@@ -358,15 +408,28 @@ def setup():
             )
             result = api.create_rich_menu(rich_menu)
             rid = result.rich_menu_id
+
+            # Step 2: 產生並上傳圖片
+            from linebot.v3.messaging import MessagingApiBlob
+            img_bytes = generate_rich_menu_image()
+            blob_api = MessagingApiBlob(api_client)
+            blob_api.set_rich_menu_image(
+                rich_menu_id=rid,
+                body=img_bytes,
+                _headers={'Content-Type': 'image/png'}
+            )
+
+            # Step 3: 設為預設選單
             api.set_default_rich_menu(rid)
-            return (f'<h2>✅ 圖文選單建立成功！</h2>'
-                    f'<p>Rich Menu ID: {rid}</p>'
-                    f'<p>已設為預設選單。</p>'
-                    f'<h3>⚠️ 還需要上傳選單圖片</h3>'
-                    f'<p>請前往 LINE Official Account Manager → 圖文選單 → 上傳圖片</p>'
-                    f'<p>或者不上傳圖片也可使用，底部會顯示「📋 飲控日記」文字列。</p>')
+
+            return (
+                '<h2>✅ 圖文選單建立並啟用成功！</h2>'
+                f'<p>Rich Menu ID: {rid}</p>'
+                '<p>底部選單現在應該出現在你的 LINE Bot 聊天畫面中。</p>'
+                '<p>如果想換成自訂圖片，可以到 LINE Official Account Manager → 圖文選單 → 上傳圖片。</p>'
+            )
     except Exception as e:
-        return f'<h2>錯誤</h2><p>{e}</p>'
+        return f'<h2>❌ 錯誤</h2><pre>{e}</pre>'
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
