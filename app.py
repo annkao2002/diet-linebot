@@ -10,7 +10,6 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
     QuickReply, QuickReplyItem, MessageAction,
-    RichMenuRequest, RichMenuArea, RichMenuBounds, RichMenuSize,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import storage
@@ -329,100 +328,6 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return 'OK'
-
-# ── 建立圖文選單（瀏覽這個網址執行一次） ────────────────
-def generate_rich_menu_image():
-    """純 Python 產生 PNG，不需要任何外部套件"""
-    import zlib, struct, io
-
-    W, H = 2500, 843
-    colors = [
-        (26, 112, 96),
-        (45, 122, 79),
-        (24, 95, 165),
-    ]
-
-    raw_rows = []
-    for y in range(H):
-        row = bytearray([0])
-        for x in range(W):
-            if x < 833:
-                r, g, b = colors[0]
-            elif x < 1667:
-                r, g, b = colors[1]
-            else:
-                r, g, b = colors[2]
-            if x in (833, 834, 1667, 1668):
-                r, g, b = 255, 255, 255
-            row += bytes([r, g, b])
-        raw_rows.append(bytes(row))
-
-    compressed = zlib.compress(b''.join(raw_rows), 6)
-
-    def chunk(name, data):
-        c = name + data
-        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
-
-    buf = io.BytesIO()
-    buf.write(b'PNG
-
-')
-    buf.write(chunk(b'IHDR', struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0)))
-    buf.write(chunk(b'IDAT', compressed))
-    buf.write(chunk(b'IEND', b''))
-    return buf.getvalue()
-
-@app.route('/setup', methods=['GET'])
-def setup():
-    try:
-        with ApiClient(configuration) as api_client:
-            api = MessagingApi(api_client)
-
-            # Step 1: 建立圖文選單結構
-            rich_menu = RichMenuRequest(
-                size=RichMenuSize(width=2500, height=843),
-                selected=True,
-                name='飲控日記選單',
-                chat_bar_text='📋 飲控日記',
-                areas=[
-                    RichMenuArea(
-                        bounds=RichMenuBounds(x=0, y=0, width=833, height=843),
-                        action=MessageAction(label='記錄身體數據', text='__記錄身體數據__')
-                    ),
-                    RichMenuArea(
-                        bounds=RichMenuBounds(x=833, y=0, width=834, height=843),
-                        action=MessageAction(label='記錄餐食', text='__記錄餐食__')
-                    ),
-                    RichMenuArea(
-                        bounds=RichMenuBounds(x=1667, y=0, width=833, height=843),
-                        action=MessageAction(label='今日總覽', text='__今日總覽__')
-                    ),
-                ]
-            )
-            result = api.create_rich_menu(rich_menu)
-            rid = result.rich_menu_id
-
-            # Step 2: 產生並上傳圖片
-            from linebot.v3.messaging import MessagingApiBlob
-            img_bytes = generate_rich_menu_image()
-            blob_api = MessagingApiBlob(api_client)
-            blob_api.set_rich_menu_image(
-                rich_menu_id=rid,
-                body=img_bytes,
-                _headers={'Content-Type': 'image/png'}
-            )
-
-            # Step 3: 設為預設選單
-            api.set_default_rich_menu(rid)
-
-            return (
-                '<h2>✅ 圖文選單建立並啟用成功！</h2>'
-                f'<p>Rich Menu ID: {rid}</p>'
-                '<p>底部選單現在應該出現在你的 LINE Bot 聊天畫面中。</p>'
-                '<p>如果想換成自訂圖片，可以到 LINE Official Account Manager → 圖文選單 → 上傳圖片。</p>'
-            )
-    except Exception as e:
-        return f'<h2>❌ 錯誤</h2><pre>{e}</pre>'
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
