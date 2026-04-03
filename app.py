@@ -5,25 +5,30 @@ import hashlib
 import hmac
 import base64
 import urllib.request
-import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, abort
 
 app = Flask(__name__)
 
 TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
 SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
-SHEET_WEBHOOK = os.environ.get('GOOGLE_SHEET_WEBHOOK', '')  # Apps Script URL
+SHEET_WEBHOOK = os.environ.get('GOOGLE_SHEET_WEBHOOK', '')
 
 user_state = {}
 
+# ── 台灣時間 UTC+8 ───────────────────────────────────────
+TW = timezone(timedelta(hours=8))
+
+def now_tw():
+    return datetime.now(TW)
+
 def today():
-    return datetime.now().strftime('%Y-%m-%d')
+    return now_tw().strftime('%Y-%m-%d')
 
 def now_time():
-    return datetime.now().strftime('%H:%M')
+    return now_tw().strftime('%H:%M')
 
-# ── 儲存（每個欄位獨立更新，不會互相覆蓋） ──────────────
+# ── 儲存 ─────────────────────────────────────────────────
 DATA_DIR = '/tmp/diet_data'
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -50,46 +55,46 @@ def _ensure_day(data, date):
         }
     return data
 
-def get_day(uid):
+def get_day(uid, date=None):
+    date = date or today()
     data = _load(uid)
-    data = _ensure_day(data, today())
-    return data[today()]
+    data = _ensure_day(data, date)
+    return data[date]
 
-def set_weight(uid, val):
+def set_weight(uid, val, date=None):
+    date = date or today()
     data = _load(uid)
-    data = _ensure_day(data, today())
-    data[today()]['weight'] = val
+    data = _ensure_day(data, date)
+    data[date]['weight'] = val
     _save(uid, data)
 
-def set_sleep(uid, val):
+def set_sleep(uid, val, date=None):
+    date = date or today()
     data = _load(uid)
-    data = _ensure_day(data, today())
-    data[today()]['sleep'] = val
+    data = _ensure_day(data, date)
+    data[date]['sleep'] = val
     _save(uid, data)
 
-def set_poop(uid, val):
+def set_poop(uid, val, date=None):
+    date = date or today()
     data = _load(uid)
-    data = _ensure_day(data, today())
-    data[today()]['poop'] = val
+    data = _ensure_day(data, date)
+    data[date]['poop'] = val
     _save(uid, data)
 
-def add_water(uid, ml):
+def add_water(uid, ml, date=None):
+    date = date or today()
     data = _load(uid)
-    data = _ensure_day(data, today())
-    data[today()]['water'] = data[today()].get('water', 0) + ml
+    data = _ensure_day(data, date)
+    data[date]['water'] = data[date].get('water', 0) + ml
     _save(uid, data)
-    return data[today()]['water']
+    return data[date]['water']
 
-def add_meal(uid, meal):
+def add_meal(uid, meal, date=None):
+    date = date or today()
     data = _load(uid)
-    data = _ensure_day(data, today())
-    data[today()]['meals'].append(meal)
-    _save(uid, data)
-
-def add_note(uid, text):
-    data = _load(uid)
-    data = _ensure_day(data, today())
-    data[today()]['notes'].append({'text': text, 'time': now_time()})
+    data = _ensure_day(data, date)
+    data[date]['meals'].append(meal)
     _save(uid, data)
 
 def get_all_data(uid):
@@ -174,6 +179,36 @@ def parse_nutrition(text):
         if m: nut[key] = float(m.group(1))
     return nut
 
+def parse_date(text):
+    """解析各種日期格式，回傳 yyyy-mm-dd 或 None"""
+    # 今天/昨天/前天
+    if text in ['今天', '今日']: return today()
+    if text in ['昨天', '昨日']:
+        d = now_tw() - timedelta(days=1)
+        return d.strftime('%Y-%m-%d')
+    if text in ['前天', '前日']:
+        d = now_tw() - timedelta(days=2)
+        return d.strftime('%Y-%m-%d')
+    # N天前
+    m = re.match(r'(\d+)\s*天前', text)
+    if m:
+        d = now_tw() - timedelta(days=int(m.group(1)))
+        return d.strftime('%Y-%m-%d')
+    # yyyy-mm-dd
+    m = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', text)
+    if m:
+        return '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    # mm/dd 或 mm-dd（補上今年）
+    m = re.match(r'(\d{1,2})[/-](\d{1,2})$', text)
+    if m:
+        year = now_tw().year
+        return '%d-%02d-%02d' % (year, int(m.group(1)), int(m.group(2)))
+    return None
+
+# ── 餐別清單（含運動前後） ────────────────────────────────
+MEAL_TYPES = ['早餐', '午餐', '晚餐', '運動前', '運動後', '下午茶', '宵夜', '點心']
+MEAL_QUICK_REPLIES = [(m, m) for m in MEAL_TYPES]
+
 # ── 狀態管理 ─────────────────────────────────────────────
 def get_state(uid):
     if uid not in user_state:
@@ -183,10 +218,17 @@ def get_state(uid):
 def clear_state(uid):
     user_state[uid] = {'step': None, 'data': {}}
 
-# ── 今日總覽 ─────────────────────────────────────────────
-def build_summary(uid):
-    day = get_day(uid)
-    lines = ['📋 %s 飲控日誌' % today(), '─' * 16]
+# ── 今日/指定日總覽 ──────────────────────────────────────
+def build_summary(uid, date=None):
+    date = date or today()
+    day = get_day(uid, date)
+    # 日期顯示
+    dt = datetime.strptime(date, '%Y-%m-%d')
+    weekdays = ['一','二','三','四','五','六','日']
+    wday = weekdays[dt.weekday()]
+    date_label = '%s（週%s）' % (date, wday)
+
+    lines = ['📋 %s 飲控日誌' % date_label, '─' * 16]
     if day.get('weight'):
         lines.append('⚖️ 體重：%s kg' % day['weight'])
     if day.get('water'):
@@ -223,7 +265,7 @@ def build_summary(uid):
         for note in day['notes']:
             lines.append('  「%s」' % note['text'])
     if len(lines) == 2:
-        lines.append('今天還沒有記錄，請使用底部選單開始！')
+        lines.append('這天還沒有記錄')
     return '\n'.join(lines)
 
 # ── Google Sheets 匯出 ───────────────────────────────────
@@ -231,20 +273,16 @@ def export_to_sheets(uid, reply_token):
     if not SHEET_WEBHOOK:
         reply_message(reply_token,
             '⚠️ 尚未設定 Google Sheets\n\n'
-            '請依照說明設定後，在 Render 環境變數加入：\n'
-            'GOOGLE_SHEET_WEBHOOK = 你的 Apps Script 網址')
+            '請在 Render 環境變數加入：\n'
+            'GOOGLE_SHEET_WEBHOOK = Apps Script 網址')
         return
-
     all_data = get_all_data(uid)
     if not all_data:
         reply_message(reply_token, '目前沒有任何資料可以匯出')
         return
-
-    # 整理成列表格式傳給 Google Apps Script
     rows = []
     for date in sorted(all_data.keys()):
         day = all_data[date]
-        # 身體數據（每天一行）
         sleep_text = ''
         if day.get('sleep'):
             s = day['sleep']
@@ -252,15 +290,11 @@ def export_to_sheets(uid, reply_token):
                 sleep_text = '%s～%s（%sh）' % (s['bed'], s['wake'], s['hours'])
             else:
                 sleep_text = '%sh' % s['hours']
-
-        base_row = {
-            'date': date,
-            'weight': day.get('weight') or '',
-            'water': day.get('water') or '',
-            'sleep': sleep_text,
+        base = {
+            'date': date, 'weight': day.get('weight') or '',
+            'water': day.get('water') or '', 'sleep': sleep_text,
             'poop': day.get('poop') or '',
         }
-
         meals = day.get('meals', [])
         if meals:
             for meal in meals:
@@ -269,7 +303,7 @@ def export_to_sheets(uid, reply_token):
                                   for i in meal.get('ingredients', [])])
                 if meal.get('oil'):
                     ings += ('、' if ings else '') + '油 ' + meal['oil']
-                row = dict(base_row)
+                row = dict(base)
                 row.update({
                     'meal_type': meal.get('type', ''),
                     'meal_name': meal.get('name', ''),
@@ -283,47 +317,39 @@ def export_to_sheets(uid, reply_token):
                 })
                 rows.append(row)
         else:
-            base_row.update({
-                'meal_type': '', 'meal_name': '', 'meal_time': '',
-                'ingredients': '', 'kcal': '', 'carb': '',
-                'protein': '', 'fat': '', 'note': ''
-            })
-            rows.append(base_row)
-
-    # 送到 Google Apps Script
+            base.update({'meal_type':'','meal_name':'','meal_time':'',
+                         'ingredients':'','kcal':'','carb':'','protein':'','fat':'','note':''})
+            rows.append(base)
     payload = json.dumps({'rows': rows}).encode('utf-8')
     req = urllib.request.Request(
-        SHEET_WEBHOOK,
-        data=payload,
-        headers={'Content-Type': 'application/json'},
-        method='POST'
-    )
+        SHEET_WEBHOOK, data=payload,
+        headers={'Content-Type': 'application/json'}, method='POST')
     try:
-        urllib.request.urlopen(req, timeout=10)
+        urllib.request.urlopen(req, timeout=15)
         reply_message(reply_token,
             '✅ 已成功匯出到 Google Sheets！\n\n'
-            '共匯出 %d 天、%d 筆餐食記錄\n'
-            '請到你的 Google Sheet 查看' % (
+            '共 %d 天、%d 筆餐食記錄\n'
+            '請到 Google Sheet 查看' % (
                 len(all_data),
-                sum(len(d.get('meals', [])) for d in all_data.values())
-            ))
+                sum(len(d.get('meals', [])) for d in all_data.values())))
     except Exception as e:
         reply_message(reply_token, '❌ 匯出失敗：%s' % str(e))
 
 # ── 身體數據流程 ─────────────────────────────────────────
-def start_body(uid, reply_token):
+def start_body(uid, reply_token, date=None):
     s = get_state(uid)
     s['step'] = 'body_weight'
-    s['data'] = {}
+    s['data'] = {'date': date or today()}
+    date_label = '今天' if (date or today()) == today() else (date or today())
     reply_message(reply_token,
-        '⚖️ 記錄身體數據\n\n'
-        '第 1/4：請輸入今日體重\n'
-        '例如：65.5\n\n'
-        '（輸入「跳過」略過此項）')
+        '⚖️ 記錄身體數據（%s）\n\n'
+        '第 1/4：請輸入體重\n例如：65.5\n\n'
+        '（輸入「跳過」略過此項）' % date_label)
 
 def handle_body(uid, text, reply_token):
     s = get_state(uid)
     step = s['step']
+    date = s['data'].get('date', today())
 
     if step == 'body_weight':
         if text != '跳過':
@@ -331,13 +357,11 @@ def handle_body(uid, text, reply_token):
             if not val:
                 reply_message(reply_token, '請輸入有效數字（例如：65.5），或輸入「跳過」')
                 return
-            set_weight(uid, val)
+            set_weight(uid, val, date)
             s['data']['weight'] = val
         s['step'] = 'body_water'
         reply_message(reply_token,
-            '💧 第 2/4：請輸入今日飲水量\n'
-            '例如：1500ml、6杯\n\n'
-            '（輸入「跳過」略過此項）')
+            '💧 第 2/4：請輸入飲水量\n例如：1500ml、6杯\n\n（輸入「跳過」略過）')
 
     elif step == 'body_water':
         if text != '跳過':
@@ -345,14 +369,11 @@ def handle_body(uid, text, reply_token):
             if not ml:
                 reply_message(reply_token, '請輸入有效格式（例如：1500ml、6杯），或輸入「跳過」')
                 return
-            total = add_water(uid, ml)
+            total = add_water(uid, ml, date)
             s['data']['water'] = total
         s['step'] = 'body_sleep'
         reply_message(reply_token,
-            '🌙 第 3/4：請輸入睡眠資訊\n'
-            '例如：睡了7.5小時\n'
-            '例如：23:00到6:30\n\n'
-            '（輸入「跳過」略過此項）')
+            '🌙 第 3/4：請輸入睡眠資訊\n例如：睡了7.5小時\n例如：23:00到6:30\n\n（輸入「跳過」略過）')
 
     elif step == 'body_sleep':
         if text != '跳過':
@@ -360,18 +381,16 @@ def handle_body(uid, text, reply_token):
             if not info:
                 reply_message(reply_token, '請輸入有效格式（例如：睡了7小時），或輸入「跳過」')
                 return
-            set_sleep(uid, info)
+            set_sleep(uid, info, date)
             s['data']['sleep'] = info
         s['step'] = 'body_poop'
         reply_message(reply_token,
-            '🚽 第 4/4：請輸入排便狀況\n'
-            '可輸入：順暢、正常、偏硬、偏軟、便秘、拉肚子\n\n'
-            '（輸入「跳過」略過此項）')
+            '🚽 第 4/4：請輸入排便狀況\n可輸入：順暢、正常、偏硬、偏軟、便秘、拉肚子\n\n（輸入「跳過」略過）')
 
     elif step == 'body_poop':
         if text != '跳過':
             status = parse_poop(text)
-            set_poop(uid, status)
+            set_poop(uid, status, date)
             s['data']['poop'] = status
         dd = s['data'].copy()
         clear_state(uid)
@@ -388,19 +407,19 @@ def handle_body(uid, text, reply_token):
         reply_message(reply_token, '\n'.join(lines))
 
 # ── 餐食流程 ─────────────────────────────────────────────
-def start_meal(uid, reply_token):
+def start_meal(uid, reply_token, date=None):
     s = get_state(uid)
     s['step'] = 'meal_type'
-    s['data'] = {}
-    reply_message(reply_token, '🍱 記錄餐食\n請選擇餐別 👇',
-        quick_replies=[
-            ('早餐', '早餐'), ('午餐', '午餐'), ('晚餐', '晚餐'),
-            ('下午茶', '下午茶'), ('宵夜', '宵夜'), ('點心', '點心')
-        ])
+    s['data'] = {'date': date or today()}
+    date_label = '今天' if (date or today()) == today() else (date or today())
+    reply_message(reply_token,
+        '🍱 記錄餐食（%s）\n請選擇餐別 👇' % date_label,
+        quick_replies=MEAL_QUICK_REPLIES)
 
 def handle_meal(uid, text, reply_token):
     s = get_state(uid)
     step = s['step']
+    date = s['data'].get('date', today())
 
     if step == 'meal_type':
         s['data']['type'] = text
@@ -438,16 +457,15 @@ def handle_meal(uid, text, reply_token):
         s['data']['nutrition'] = parse_nutrition(text) if text != '跳過' else {}
         s['step'] = 'meal_note'
         reply_message(reply_token,
-            '第 4/4：餐後心得（選填）\n'
-            '例如：飽足感不錯\n\n'
-            '（輸入「跳過」完成記錄）')
+            '第 4/4：餐後心得（選填）\n例如：飽足感不錯\n\n（輸入「跳過」完成記錄）')
 
     elif step == 'meal_note':
         if text != '跳過':
             s['data']['note'] = text
         meal = s['data'].copy()
+        meal_date = meal.pop('date', today())
         clear_state(uid)
-        add_meal(uid, meal)
+        add_meal(uid, meal, meal_date)
         lines = ['✅ %s記錄完成！（%s）\n' % (meal.get('type', ''), meal.get('time', ''))]
         lines.append('🍽 %s' % meal.get('name', ''))
         for ing in meal.get('ingredients', []):
@@ -463,21 +481,81 @@ def handle_meal(uid, text, reply_token):
         if meal.get('note'): lines.append('\n💬 %s' % meal['note'])
         reply_message(reply_token, '\n'.join(lines))
 
+# ── 補記流程 ─────────────────────────────────────────────
+def start_backfill(uid, reply_token):
+    s = get_state(uid)
+    s['step'] = 'backfill_date'
+    s['data'] = {}
+    reply_message(reply_token,
+        '📅 補記過去的資料\n\n'
+        '請輸入要補記的日期：\n\n'
+        '可輸入格式：\n'
+        '· 昨天\n'
+        '· 前天\n'
+        '· 3天前\n'
+        '· 4/1\n'
+        '· 2026-04-01\n\n'
+        '（輸入「取消」返回）')
+
+def handle_backfill(uid, text, reply_token):
+    s = get_state(uid)
+    step = s['step']
+
+    if step == 'backfill_date':
+        date = parse_date(text)
+        if not date:
+            reply_message(reply_token, '無法辨識日期，請重新輸入\n例如：昨天、3天前、4/1')
+            return
+        # 不能補記未來
+        if date > today():
+            reply_message(reply_token, '不能補記未來的日期，請重新輸入')
+            return
+        s['data']['date'] = date
+        s['step'] = 'backfill_type'
+        reply_message(reply_token,
+            '📅 補記 %s\n\n要補記什麼？' % date,
+            quick_replies=[
+                ('身體數據', '__補記身體_%s__' % date),
+                ('餐食記錄', '__補記餐食_%s__' % date),
+                ('查看當天', '__查看_%s__' % date),
+            ])
+
 # ── 主處理 ───────────────────────────────────────────────
 def handle_text(uid, text, reply_token):
     s = get_state(uid)
 
+    # ── 圖文選單 ──
     if text == '__記錄身體數據__':
         start_body(uid, reply_token); return
     if text == '__記錄餐食__':
         start_meal(uid, reply_token); return
     if text in ['__今日總覽__', '今日總覽', '今日報告']:
         reply_message(reply_token, build_summary(uid)); return
-    if text in ['__匯出__', '匯出', '匯出到Google Sheets', '匯出資料']:
+    if text in ['__補記__', '補記', '補記資料']:
+        start_backfill(uid, reply_token); return
+    if text in ['__匯出__', '匯出', '匯出資料']:
         export_to_sheets(uid, reply_token); return
+
+    # ── 補記快捷指令 ──
+    m = re.match(r'__補記身體_(.+)__', text)
+    if m:
+        clear_state(uid)
+        start_body(uid, reply_token, date=m.group(1)); return
+    m = re.match(r'__補記餐食_(.+)__', text)
+    if m:
+        clear_state(uid)
+        start_meal(uid, reply_token, date=m.group(1)); return
+    m = re.match(r'__查看_(.+)__', text)
+    if m:
+        clear_state(uid)
+        reply_message(reply_token, build_summary(uid, date=m.group(1))); return
+
+    # ── 取消 ──
     if text in ['取消', '重來']:
         clear_state(uid)
         reply_message(reply_token, '已取消，請重新選擇功能'); return
+
+    # ── 說明 ──
     if text in ['說明', 'help']:
         reply_message(reply_token,
             '🌿 飲控日記使用說明\n\n'
@@ -485,21 +563,31 @@ def handle_text(uid, text, reply_token):
             '🏥 記錄身體數據\n'
             '🍱 記錄餐食\n'
             '📋 今日總覽\n'
+            '📅 補記過去資料\n'
             '📤 匯出 Google Sheets\n\n'
             '每步驟可輸入「跳過」略過\n'
-            '輸入「取消」中斷操作'); return
+            '輸入「取消」中斷操作\n\n'
+            '補記格式：\n'
+            '輸入「補記」→ 選日期 → 選類型'); return
 
-    # 餐別快速回覆
-    if text in ['早餐', '午餐', '晚餐', '下午茶', '宵夜', '點心'] and s.get('step') == 'meal_type':
+    # ── 餐別快速回覆 ──
+    if text in MEAL_TYPES and s.get('step') == 'meal_type':
         handle_meal(uid, text, reply_token); return
 
-    # 進行中的流程
+    # ── 補記流程 ──
+    if s.get('step') == 'backfill_date':
+        handle_backfill(uid, text, reply_token); return
+
+    # ── 進行中流程 ──
     if s.get('step') and s['step'].startswith('body_'):
         handle_body(uid, text, reply_token); return
     if s.get('step') and s['step'].startswith('meal_'):
         handle_meal(uid, text, reply_token); return
 
-    reply_message(reply_token, '請使用底部選單開始記錄 👇\n\n輸入「說明」查看使用方法')
+    reply_message(reply_token,
+        '請使用底部選單開始記錄 👇\n\n'
+        '輸入「說明」查看使用方法\n'
+        '輸入「補記」補記過去資料')
 
 # ── Webhook ───────────────────────────────────────────────
 @app.route('/callback', methods=['POST'])
