@@ -332,52 +332,45 @@ def callback():
 
 # ── 建立圖文選單（瀏覽這個網址執行一次） ────────────────
 def generate_rich_menu_image():
-    """
-    用 Pillow 產生一張簡單的圖文選單圖片（2500x843）
-    三個按鈕：記錄身體數據 / 記錄餐食 / 今日總覽
-    """
-    from PIL import Image, ImageDraw, ImageFont
-    import io
+    """純 Python 產生 PNG，不需要任何外部套件"""
+    import zlib, struct, io
 
     W, H = 2500, 843
-    img = Image.new('RGB', (W, H), color='#1a7060')
-    draw = ImageDraw.Draw(img)
-
-    sections = [
-        {'x': 0,    'w': 833,  'bg': '#1a7060', 'border': '#ffffff', 'emoji': '🏥', 'label': '記錄身體數據'},
-        {'x': 833,  'w': 834,  'bg': '#2d7a4f', 'border': '#ffffff', 'emoji': '🍱', 'label': '記錄餐食'},
-        {'x': 1667, 'w': 833,  'bg': '#185fa5', 'border': '#ffffff', 'emoji': '📋', 'label': '今日總覽'},
+    colors = [
+        (26, 112, 96),
+        (45, 122, 79),
+        (24, 95, 165),
     ]
 
-    # Try to load a font, fall back to default
-    try:
-        font_big = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 100)
-        font_small = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 80)
-    except Exception:
-        font_big = ImageFont.load_default()
-        font_small = font_big
+    raw_rows = []
+    for y in range(H):
+        row = bytearray([0])
+        for x in range(W):
+            if x < 833:
+                r, g, b = colors[0]
+            elif x < 1667:
+                r, g, b = colors[1]
+            else:
+                r, g, b = colors[2]
+            if x in (833, 834, 1667, 1668):
+                r, g, b = 255, 255, 255
+            row += bytes([r, g, b])
+        raw_rows.append(bytes(row))
 
-    for sec in sections:
-        x, w = sec['x'], sec['w']
-        # Background
-        draw.rectangle([x, 0, x+w, H], fill=sec['bg'])
-        # Divider line
-        draw.line([(x, 0), (x, H)], fill='#ffffff', width=3)
-        # Label text (center)
-        label = sec['label']
-        bbox = draw.textbbox((0, 0), label, font=font_small)
-        tw = bbox[2] - bbox[0]
-        tx = x + (w - tw) // 2
-        ty = H // 2 + 20
-        draw.text((tx, ty), label, font=font_small, fill='#ffffff')
-        # Simple circle for emoji area
-        cx, cy, r = x + w//2, H//2 - 100, 110
-        draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill='rgba(255,255,255,30)', outline='#ffffff', width=4)
+    compressed = zlib.compress(b''.join(raw_rows), 6)
+
+    def chunk(name, data):
+        c = name + data
+        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
 
     buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-    return buf.read()
+    buf.write(b'PNG
+
+')
+    buf.write(chunk(b'IHDR', struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0)))
+    buf.write(chunk(b'IDAT', compressed))
+    buf.write(chunk(b'IEND', b''))
+    return buf.getvalue()
 
 @app.route('/setup', methods=['GET'])
 def setup():
