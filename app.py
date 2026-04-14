@@ -345,6 +345,25 @@ def build_summary(uid, date=None):
     return '\n'.join(lines)
 
 # ── Google Sheets 匯出 ───────────────────────────────────
+
+def get_line_display_name(uid):
+    """取得 LINE 用戶顯示名稱"""
+    req = urllib.request.Request(
+        'https://api.line.me/v2/bot/profile/' + uid,
+        headers={'Authorization': 'Bearer ' + TOKEN},
+        method='GET'
+    )
+    try:
+        with urllib.request.urlopen(req) as r:
+            data = json.loads(r.read().decode('utf-8'))
+            name = data.get('displayName', '')
+            # 移除不合法的工作表名稱字元
+            import re as _re
+            name = _re.sub(r'[\\/*?:\[\]]', '', name).strip()[:20]
+            return name if name else uid[-6:]
+    except Exception:
+        return uid[-6:]
+
 def export_to_sheets(uid, reply_token):
     if not SHEET_WEBHOOK:
         reply_message(reply_token, '⚠️ 尚未設定 GOOGLE_SHEET_WEBHOOK 環境變數')
@@ -397,7 +416,12 @@ def export_to_sheets(uid, reply_token):
                          'ingredients':'','kcal':'','carb':'','protein':'','fat':'','note':''})
             rows.append(base)
 
-    payload = json.dumps({'rows': rows}).encode('utf-8')
+    display_name = get_line_display_name(uid)
+    payload = json.dumps({
+        'rows': rows,
+        'uid': uid,
+        'display_name': display_name
+    }).encode('utf-8')
     req = urllib.request.Request(
         SHEET_WEBHOOK, data=payload,
         headers={'Content-Type': 'application/json'}, method='POST')
@@ -405,7 +429,8 @@ def export_to_sheets(uid, reply_token):
         urllib.request.urlopen(req, timeout=15)
         reply_message(reply_token,
             '✅ 已成功匯出到 Google Sheets！\n\n'
-            '共 %d 天、%d 筆餐食記錄' % (len(dates), len(rows)))
+            '工作表名稱：%s_飲控記錄\n'
+            '共 %d 天、%d 筆餐食記錄' % (display_name, len(dates), len(rows)))
     except Exception as e:
         reply_message(reply_token, '❌ 匯出失敗：%s' % str(e))
 
