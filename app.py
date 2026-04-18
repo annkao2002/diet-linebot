@@ -216,10 +216,12 @@ def parse_poop(text):
 
 def parse_ingredients(text):
     out = []
-    for m in re.finditer(r'([^\d\s，,、\n]+?)\s*(\d+(?:\.\d+)?)\s*(g|kg|ml|cc|克|毫升|公克)?', text):
-        name = m.group(1).strip('、，, \t')
+    pattern = r'([^\d\s\uff0c,\u3001\n]+?)\s*(\d+(?:\.\d+)?)\s*(g|kg|ml|cc|\u514b|\u516c\u514b|\u6beb\u5347|\u516c\u5347|\u984f|\u7c92|\u7247|\u689d|\u584a|\u6839|\u6735|\u5319|\u78d7|\u4efd|\u5305|\u7f50|\u74f6|\u676f|\u500b|\u96bb|\u5c3e)?'
+    for m in re.finditer(pattern, text):
+        name = m.group(1).strip('\u3001\uff0c, \t')
         if name and m.group(2):
-            out.append({'name': name, 'amount': float(m.group(2)), 'unit': m.group(3) or 'g'})
+            unit = m.group(3) if m.group(3) else 'g'
+            out.append({'name': name, 'amount': float(m.group(2)), 'unit': unit})
     return out
 
 def parse_nutrition(text):
@@ -346,6 +348,71 @@ def build_summary(uid, date=None):
 
 # ── Google Sheets 匯出 ───────────────────────────────────
 
+
+def save_user_sheet_id(uid, sheet_id):
+    """儲存用戶自訂的 Google Sheet ID 到 Supabase"""
+    upsert_diet_record(uid, 'settings', {'poop': 'sheet_id:' + sheet_id})
+
+def get_user_sheet_id(uid):
+    """取得用戶自訂的 Google Sheet ID"""
+    # 用 notes 表儲存設定
+    rows = sb_get('meal_records', **{
+        'user_id': 'eq.' + uid,
+        'date': 'eq.settings',
+        'select': 'note'
+    })
+    if rows and rows[0].get('note', '').startswith('sheet_id:'):
+        return rows[0]['note'].replace('sheet_id:', '')
+    return None
+
+def save_sheet_setting(uid, sheet_id):
+    url = SUPABASE_URL + '/rest/v1/meal_records'
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({
+            'user_id': uid,
+            'date': 'settings',
+            'meal_type': 'setting',
+            'meal_name': 'google_sheet',
+            'note': 'sheet_id:' + sheet_id
+        }).encode('utf-8'),
+        method='POST',
+        headers={
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + SUPABASE_KEY,
+            'apikey': SUPABASE_KEY,
+            'Prefer': 'resolution=merge-duplicates,return=representation',
+            'on_conflict': 'user_id,date'
+        }
+    )
+    try:
+        urllib.request.urlopen(req)
+        return True
+    except Exception as e:
+        print('save sheet error: %s' % e)
+        return False
+
+def get_sheet_setting(uid):
+    rows = sb_get('meal_records', **{
+        'user_id': 'eq.' + uid,
+        'date': 'eq.settings',
+        'meal_name': 'eq.google_sheet'
+    })
+    if rows and rows[0].get('note', '').startswith('sheet_id:'):
+        return rows[0]['note'].replace('sheet_id:', '')
+    return None
+
+def extract_sheet_id(text):
+    """從 Google Sheet 網址或 ID 中提取 Sheet ID"""
+    import re as _re
+    m = _re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', text)
+    if m:
+        return m.group(1)
+    # 如果直接貼 ID
+    if _re.match(r'^[a-zA-Z0-9_-]{20,}$', text.strip()):
+        return text.strip()
+    return None
+
 def get_line_display_name(uid):
     """取得 LINE 用戶顯示名稱"""
     req = urllib.request.Request(
@@ -417,20 +484,28 @@ def export_to_sheets(uid, reply_token):
             rows.append(base)
 
     display_name = get_line_display_name(uid)
+    user_sheet_id = get_sheet_setting(uid)
     payload = json.dumps({
         'rows': rows,
         'uid': uid,
-        'display_name': display_name
+        'display_name': display_name,
+        'sheet_id': user_sheet_id or ''
     }).encode('utf-8')
     req = urllib.request.Request(
         SHEET_WEBHOOK, data=payload,
         headers={'Content-Type': 'application/json'}, method='POST')
     try:
         urllib.request.urlopen(req, timeout=15)
-        reply_message(reply_token,
-            '✅ 已成功匯出到 Google Sheets！\n\n'
-            '工作表名稱：%s_飲控記錄\n'
-            '共 %d 天、%d 筆餐食記錄' % (display_name, len(dates), len(rows)))
+        if user_sheet_id:
+            reply_message(reply_token,
+                '✅ 已成功匯出到你的 Google Sheets！\n\n'
+                '共 %d 天、%d 筆餐食記錄' % (len(dates), len(rows)))
+        else:
+            reply_message(reply_token,
+                '✅ 已成功匯出到 Google Sheets！\n\n'
+                '工作表名稱：%s_飲控記錄\n'
+                '共 %d 天、%d 筆餐食記錄\n\n'
+                '💡 輸入「設定Sheet」可匯出到你自己的試算表' % (display_name, len(dates), len(rows)))
     except Exception as e:
         reply_message(reply_token, '❌ 匯出失敗：%s' % str(e))
 
@@ -636,6 +711,29 @@ def handle_text(uid, text, reply_token):
         start_backfill(uid, reply_token); return
     if text in ['__匯出__', '匯出', '匯出資料']:
         export_to_sheets(uid, reply_token); return
+    # 設定 Google Sheet
+    if text in ['設定Sheet', '設定sheet', '設定試算表', '__設定Sheet__']:
+        get_state(uid)['step'] = 'set_sheet'
+        reply_message(reply_token,
+            '📊 設定你的 Google Sheet\n\n'
+            '請貼上你的 Google Sheet 網址：\n'
+            'https://docs.google.com/spreadsheets/d/xxxxx/edit\n\n'
+            '⚠️ 記得先將 Sheet 分享給：\n'
+            'ann2002120234@gmail.com\n'
+            '（權限選「編輯者」）'); return
+
+    if get_state(uid).get('step') == 'set_sheet':
+        sheet_id = extract_sheet_id(text)
+        if not sheet_id:
+            reply_message(reply_token, '無法辨識 Sheet 網址，請重新貼上完整的 Google Sheet 網址')
+            return
+        save_sheet_setting(uid, sheet_id)
+        get_state(uid)['step'] = None
+        reply_message(reply_token,
+            '✅ 已設定完成！\n\n'
+            '下次匯出就會自動寫到你的 Sheet。\n'
+            '按「匯出資料」試試看！'); return
+
     if text in ['取消', '重來']:
         clear_state(uid)
         reply_message(reply_token, '已取消，請重新選擇功能'); return
